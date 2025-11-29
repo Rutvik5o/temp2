@@ -252,43 +252,175 @@ def extractive_summary_from_passages(passages, question, max_sentences=3):
     top = [s for _, s in scored_sentences[:max_sentences]]
     return " ".join(top) if top else None
 
-def init_gemini():
+# robust_gemini_helpers.py (paste into your app)
+
+import time
+import threading
+
+# ------------- init (safe) -------------
+def init_gemini_safe():
+    """
+    Initialize the google.generativeai client if available and key present.
+    Returns (ok:bool, reason:str). Do not raise.
+    """
     if not _HAS_GEMINI:
-        return False
+        return False, "Gemini SDK not installed (google.generativeai)."
+    api_key = None
     try:
-        api_key = st.secrets["GEMINI_API_KEY"]
-        genai.configure(api_key=api_key)
-        return True
+        api_key = st.secrets.get("GEMINI_API_KEY") or None
     except Exception:
-        return False
-
-def call_gemini_generate(context_text: str, user_question: str):
-    if not _HAS_GEMINI:
-        return None
-    ok = init_gemini()
-    if not ok:
-        return None
+        api_key = None
+    if not api_key:
+        return False, "GEMINI_API_KEY missing in st.secrets."
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = f"""
-You are a customer churn analytics assistant.
-Use ONLY the context below — do NOT hallucinate. Answer concisely and reference context.
+        genai.configure(api_key=api_key)
+        return True, "OK"
+    except Exception as e:
+        return False, f"gemini configure failed: {e}"
 
-CONTEXT:
+# ------------- call with timeout & parsing -------------
+def call_gemini_generate_safe(context_text: str, user_question: str, model_name="gemini-1.5-flash", timeout_sec=12):
+    """
+    Calls Gemini and returns a human-readable string, or None on failure.
+    - Tries to init the SDK (safe)
+    - Uses a background thread to enforce timeout (so Streamlit spinner won't block forever)
+    - Parses common response shapes (response.text, response.candidates[0].content, etc.)
+    """
+    ok, reason = init_gemini_safe()
+    if not ok:
+        # debug info: return reason so UI can show it if desired
+        return None, f"Gemini init failed: {reason}"
+
+    result_container = {"resp": None, "err": None}
+    def worker():
+        try:
+            # new + old SDKs differ; try the higher-level approach first
+            model = genai.GenerativeModel(model_name)
+            prompt = f"""You are a concise data-analytics assistant. Use ONLY the context below to answer the QUESTION.
+Context:
 {context_text}
 
-QUESTION:
+Question:
 {user_question}
 
 Provide:
-1) Direct answer
-2) Short reasoning referencing context
-3) 2–3 actionable insights.
+1) A short direct answer in plain English.
+2) One-line reasoning referencing the context.
+3) Two short actionable recommendations.
 """
-        response = model.generate_content(prompt)
-        return response.text if hasattr(response, "text") else str(response)
-    except Exception:
-        return None
+            # `generate_content` for google-generativeai 0.8.5
+            resp = model.generate_content(prompt)
+            result_container["resp"] = resp
+        except Exception as e:
+            result_container["err"] = e
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_sec)
+    if thread.is_alive():
+        # still running -> timed out; we won't block further
+        return None, f"Gemini call timed out after {timeout_sec}s"
+
+    if result_container["err"] is not None:
+        return None, f"Gemini call error: {repr(result_container['err'])}"
+
+    resp = result_container["resp"]
+    if resp is None:
+        return None, "Gemini returned no response object."
+
+    # Parse common shapes: resp.text or resp.candidates / resp.output / resp.result
+    try:
+        # 0.8.5 returns objects with .text sometimes
+        if hasattr(resp, "text") and resp.text:
+            return str(resp.text), "OK (text)"
+        # some versions wrap content in .candidates or .output
+        if hasattr(resp, "candidates") and getattr(resp, "candidates"):
+            cand = resp.candidates[0]
+            # candidate may have .content or .text
+            if hasattr(cand, "content") and getattr(cand, "content"):
+                # content might be dictionary or object -> stringify
+                return str(cand.content), "OK (candidates.content)"
+            if hasattr(cand, "text") and getattr(cand, "text"):
+                return str(cand.text), "OK (candidates.text)"
+        if hasattr(resp, "output") and getattr(resp, "output"):
+            return str(resp.output), "OK (output)"
+    except Exception as e:
+        return None, f"Error parsing Gemini response: {e}"
+
+    # Last resort: stringify whole resp
+    try:
+        return str(resp), "OK (stringified)"
+    except Exception as e:
+        return None, f"Could not stringify Gemini response: {e}"
+
+
+# ------------- humanize extracted retrieved passages -------------
+def format_human_answer_from_retrieved(retrieved, question, df_filtered=None, max_examples=3):
+    """
+    Builds a human-readable explanation from retrieved passages (list of (score, passage, idx)).
+    Includes: direct answer attempt, reasoning, short examples from data.
+    """
+    # 1) Compose direct observation (very simple heuristic)
+    top_passages = retrieved[:max_examples]
+    # create short bullets
+    bullets = []
+    for score, passage, idx in top_passages:
+        short = passage
+        if len(short) > 240:
+            short = short[:240].rsplit(" ", 1)[0] + "..."
+        bullets.append(f"- (score {score:.3f}) {short}")
+
+    # 2) Try to infer a direct English answer using small heuristics
+    # Example: if question contains 'which contract' or 'highest churn'
+    qlow = question.lower()
+    inferred = None
+    if "highest churn" in qlow or "which contract" in qlow or "which plan" in qlow:
+        # scan passages for 'Contract: X' and 'Churn: Yes' frequency
+        cnt = {}
+        for _, p, _ in retrieved:
+            if "contract:" in p.lower():
+                # crude parse
+                try:
+                    parts = [s.strip() for s in p.split("|")]
+                    contract = None
+                    churn = None
+                    for part in parts:
+                        k = part.split(":", 1)
+                        if len(k) == 2:
+                            key = k[0].strip().lower()
+                            val = k[1].strip()
+                            if key == "contract":
+                                contract = val
+                            if key == "churn":
+                                churn = val.lower()
+                    if contract:
+                        key = contract
+                        if key not in cnt:
+                            cnt[key] = {"yes":0, "no":0}
+                        if churn and "y" in churn:
+                            cnt[key]["yes"] += 1
+                        else:
+                            cnt[key]["no"] += 1
+                except Exception:
+                    pass
+        if cnt:
+            best = sorted(cnt.items(), key=lambda t: t[1]["yes"], reverse=True)[0]
+            inferred = f"It looks like customers with contract '{best[0]}' have a higher observed churn in retrieved passages (churned {best[1]['yes']} vs retained {best[1]['no']})."
+
+    # 3) Build final human text
+    human = []
+    human.append(f"**Question:** {question}")
+    if inferred:
+        human.append(f"**Quick answer (inferred):** {inferred}")
+    else:
+        human.append("**Quick answer:** Based on the retrieved records, I couldn't compute an exact aggregated metric here; see sample records below.")
+    human.append("**Reasoning / evidence from dataset (top passages):**")
+    human.extend(bullets)
+    if df_filtered is not None:
+        human.append(f"**Notes:** Analysis used filtered dataset with {len(df_filtered):,} rows.")
+    human.append("**Actionable suggestions:** 1) Inspect the top contract groups for churn frequency; 2) Run an aggregated pivot 'Contract vs churn rate' in the dashboard.")
+    return "\n\n".join(human)
+
 
 # ------------------------- MAIN: RUN ANALYSIS ----------------------------------
 if run_analysis:
@@ -590,7 +722,15 @@ if st.button("Run RAG", key="run_rag_ui"):
                 if gemini_checkbox:
                     try:
                         st.info("Calling Gemini (this may take several seconds)...")
-                        gemini_answer = call_gemini_generate(context_text, user_question)
+                        gem_ans, gem_meta = call_gemini_generate_safe(ctx_text, user_question, timeout_sec=12)
+if gem_ans:
+    st.subheader("Answer (Gemini)")
+    st.write(gem_ans)
+else:
+    st.warning(f"Gemini not available: {gem_meta}")
+    # fallback
+    st.subheader("Fallback (Extractive, humanized)")
+    st.markdown(format_human_answer_from_retrieved(retrieved, user_question, df2))
                     except Exception as e:
                         st.error(f"Gemini call failed: {e}")
                         gemini_answer = None
