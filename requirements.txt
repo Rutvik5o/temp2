@@ -1,6 +1,9 @@
 streamlit>=1.24.0
-pandas>=1.5.3
-numpy>=1.24.0
+pandas>=2.2.3
+numpy>=2.1.0
 plotly>=5.13.1
-scikit-learn>=1.2.2
+scikit-learn==1.6.3
+# If you want the legacy Gemini SDK (works but legacy) — pin a known available version:
 google-generativeai==0.8.5
+# Or, if you want the newer SDK, comment out the line above and install:
+# google-genai>=0.2.0
