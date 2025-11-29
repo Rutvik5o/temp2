@@ -1,16 +1,13 @@
 # app.py
-# Combined: PowerBI-style Dark Churn Dashboard + RAG Q&A with robust Gemini caller
+# Combined: PowerBI-style Dark Churn Dashboard + RAG Q&A with Gemini (optional)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import os
-import concurrent.futures
-import traceback
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from typing import Optional
+import textwrap
 
 # Optional Gemini client - import lazily (so app runs if package missing)
 try:
@@ -20,17 +17,22 @@ except Exception:
     genai = None
     _HAS_GEMINI = False
 
+# TF-IDF retrieval
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ------------------------- PAGE CONFIG -------------------------------------
 st.set_page_config(
     page_title="Customer Churn Analyzer — PowerBI Dark + RAG",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ------------------------- Visual / Palette --------------------------------
+# ------------------------- COLOR PALETTE ----------------------------------
 PALETTE = px.colors.qualitative.Plotly
 ACCENT = "#0ea5a3"
 
-# ------------------------- Dark theme CSS ---------------------------------
+# ------------------------- DARK THEME CSS ---------------------------------
 CSS = r'''
 <style>
 :root{--bg:#0b1220;--card:#0f1724;--muted:#9aa4b2;--accent:#0ea5a3;--accent-2:#06b6d4;}
@@ -55,8 +57,8 @@ section[data-testid="stSidebar"] .css-1lcbmhc{ background: linear-gradient(180de
 .metric-value {font-size:1.45rem; font-weight:700; color: #e6f7f2}
 .info-card {background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border-radius:10px; padding:12px;}
 .small-muted {color:var(--muted); font-size:13px}
-.stButton>button{ background: linear-gradient(90deg,var(--accent),var(--accent-2)); color:white; border:none; padding:8px 18px; border-radius:10px; font-weight:600; box-shadow: 0 6px 20px rgba(14,165,163,0.18);}
-.chart-card { padding:10px; background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005)); border-radius:10px; box-shadow: 0 10px 30px rgba(2,6,23,0.6); border: 1px solid rgba(255,255,255,0.02);}
+.stButton>button{ background: linear-gradient(90deg,var(--accent),var(--accent-2)); color:white; border:none; padding:8px 18px; border-radius:10px; font-weight:600; box-shadow: 0 6px 20px rgba(14,165,163,0.18); }
+.chart-card { padding:10px; background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005)); border-radius:10px; box-shadow: 0 10px 30px rgba(2,6,23,0.6); border: 1px solid rgba(255,255,255,0.02); }
 </style>
 '''
 st.markdown(CSS, unsafe_allow_html=True)
@@ -85,7 +87,7 @@ with col_left:
     uploaded = st.file_uploader("📁 Upload CSV (Telco-style)", type=["csv"], key="uploader_combined")
     st.markdown('<div class="small-muted">CSV should include customerID,tenure,MonthlyCharges,TotalCharges,Contract,InternetService,PaymentMethod,Churn (map in sidebar)</div>', unsafe_allow_html=True)
 with col_right:
-    st.markdown('<div class="info-card"><strong>⚡ Quick Tips</strong><br>• Ensure Tenure & MonthlyCharges are numeric<br>• Churn: Yes/No or 1/0<br>• Optional: set GEMINI_API_KEY in Streamlit secrets to enable Gemini</div>', unsafe_allow_html=True)
+    st.markdown('<div class="info-card"><strong>⚡ Quick Tips</strong><br>• Ensure Tenure & MonthlyCharges are numeric<br>• Churn: Yes/No or 1/0<br>• Optional: set GEMINI_API_KEY in Streamlit secrets to enable Gemini answers</div>', unsafe_allow_html=True)
 
 # ------------------------- LOAD DATA -------------------------------------
 SAMPLE = "/mnt/data/chrundata.csv"
@@ -94,7 +96,7 @@ if uploaded is None:
         try:
             df = pd.read_csv(SAMPLE)
             st.success("✅ Loaded sample dataset")
-        except Exception as e:
+        except Exception:
             st.error("❌ Sample dataset error. Please upload a CSV file.")
             st.stop()
     else:
@@ -143,12 +145,11 @@ st.sidebar.markdown("---")
 run_analysis = st.sidebar.button("🚀 Run Analysis")
 
 # ------------------------- HELPERS ---------------------------------------
-def normalize_churn(series: pd.Series) -> pd.Series:
+def normalize_churn(series):
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors='coerce')
     s = series.astype(str).str.strip().str.lower()
-    mapping = {'yes':1, 'y':1, 'true':1, '1':1, 't':1, 'churn':1, 'no':0, 'n':0, 'false':0, '0':0, 'stay':0, 'retained':0}
-    return s.map(mapping).astype(float)
+    return s.map({'yes':1, 'y':1, 'true':1, '1':1, 't':1, 'churn':1, 'no':0, 'n':0, 'false':0, '0':0, 'stay':0, 'retained':0}).astype(float)
 
 def dark_plotly_layout(fig, height=420, showlegend=True, rotate_x=False):
     fig.update_layout(
@@ -171,7 +172,12 @@ def dark_plotly_layout(fig, height=420, showlegend=True, rotate_x=False):
     return fig
 
 # ------------------------- RAG Helpers -----------------------------------
-def row_to_text(row: pd.Series) -> str:
+# Performance-safe RAG defaults
+MAX_RAG_ROWS = 2000
+MAX_PASSAGE_CHARS = 1200
+TFIDF_MAX_FEATURES = 5000
+
+def row_to_text(row: pd.Series):
     parts = []
     for k, v in row.items():
         if pd.isna(v):
@@ -184,24 +190,40 @@ def row_to_text(row: pd.Series) -> str:
                 parts.append(f"{k}: {s}")
     return " | ".join(parts)
 
-def build_corpus_from_df(df_local: pd.DataFrame, max_rows: int = 5000):
-    corpus = []
-    # Efficient iteration for big df; cap at max_rows for retrieval sanity
-    rows = min(len(df_local), max_rows)
-    for i in range(rows):
-        txt = row_to_text(df_local.iloc[i])
-        if txt:
-            corpus.append(txt)
-    return corpus
+def build_corpus_from_df_sampled(df_local, max_rows=MAX_RAG_ROWS, max_chars=MAX_PASSAGE_CHARS):
+    if df_local is None or df_local.shape[0] == 0:
+        return []
+    n = len(df_local)
+    if n <= max_rows:
+        sample_df = df_local
+    else:
+        head_n = min(300, max_rows // 10)
+        tail_n = max_rows - head_n
+        head_df = df_local.head(head_n)
+        tail_df = df_local.sample(n=tail_n, random_state=42)
+        sample_df = pd.concat([head_df, tail_df], ignore_index=True)
+    passages = []
+    for i in range(len(sample_df)):
+        txt = row_to_text(sample_df.iloc[i])
+        if not txt:
+            continue
+        if len(txt) > max_chars:
+            txt = txt[:max_chars] + " ...[truncated]"
+        passages.append(txt)
+    return passages
 
-def build_tfidf_index(passages):
+def build_tfidf_index_safe(passages, max_features=TFIDF_MAX_FEATURES):
     if not passages:
         return None, None
-    vect = TfidfVectorizer(stop_words="english", max_features=20000)
-    mat = vect.fit_transform(passages)
+    vect = TfidfVectorizer(stop_words="english", max_features=max_features)
+    try:
+        mat = vect.fit_transform(passages)
+    except Exception as e:
+        st.error(f"TF-IDF build failed: {e}")
+        return None, None
     return vect, mat
 
-def retrieve_top_k(query: str, vect, mat, passages, k: int = 3):
+def retrieve_top_k_from_index(query, vect, mat, passages, k=3):
     if vect is None or mat is None:
         return []
     qv = vect.transform([query])
@@ -230,42 +252,26 @@ def extractive_summary_from_passages(passages, question, max_sentences=3):
     top = [s for _, s in scored_sentences[:max_sentences]]
     return " ".join(top) if top else None
 
-# ------------------------- Gemini Safe Caller ------------------------------
 def init_gemini():
-    """Return True if gemini client configured, False otherwise."""
     if not _HAS_GEMINI:
         return False
     try:
-        api_key = st.secrets.get("GEMINI_API_KEY")
-        if not api_key:
-            return False
+        api_key = st.secrets["GEMINI_API_KEY"]
         genai.configure(api_key=api_key)
         return True
     except Exception:
         return False
 
-def _gemini_worker(prompt: str):
-    """Worker that actually calls the SDK. Keep this small."""
-    # Model name can be adjusted depending on availability
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    resp = model.generate_content(prompt)
-    return resp
-
-def call_gemini_generate(context_text: str, user_question: str, timeout_sec: int = 20) -> Optional[str]:
-    """
-    Safe Gemini call with timeout and error handling.
-    Returns text on success or None on failure/timeout.
-    """
+def call_gemini_generate(context_text: str, user_question: str):
     if not _HAS_GEMINI:
-        # SDK not installed
         return None
-
-    if not init_gemini():
-        # Not configured via secrets
+    ok = init_gemini()
+    if not ok:
         return None
-
-    # Keep prompt compact and explicit
-    prompt = f"""You are a customer churn analytics assistant.
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = f"""
+You are a customer churn analytics assistant.
 Use ONLY the context below — do NOT hallucinate. Answer concisely and reference context.
 
 CONTEXT:
@@ -279,44 +285,15 @@ Provide:
 2) Short reasoning referencing context
 3) 2–3 actionable insights.
 """
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_gemini_worker, prompt)
-            try:
-                resp = fut.result(timeout=timeout_sec)
-            except concurrent.futures.TimeoutError:
-                fut.cancel()
-                return None
-
-        # Extract text safely
-        text = None
-        if hasattr(resp, "text"):
-            text = resp.text
-        elif isinstance(resp, dict) and "candidates" in resp:
-            cand = resp.get("candidates")
-            if cand and isinstance(cand, (list, tuple)) and len(cand) > 0:
-                text = cand[0].get("content", None)
-        else:
-            text = str(resp)
-
-        if not text or text.strip() == "":
-            return None
-
-        return text
-
+        response = model.generate_content(prompt)
+        return response.text if hasattr(response, "text") else str(response)
     except Exception:
-        # return None to let caller fallback; log traceback in a debug textarea only if running locally
-        tb = traceback.format_exc()
-        # show debug trace if dev wants - small text area
-        st.text_area("Gemini exception (debug)", tb, height=120)
         return None
 
-# ------------------------- RUN ANALYSIS ----------------------------------
+# ------------------------- MAIN: RUN ANALYSIS ----------------------------------
 if run_analysis:
+    # compute filtered df2 and store in session_state (so RAG uses it)
     df2 = df.copy()
-
-    # Apply segment filters safely
     for s, selvals in segment_filters.items():
         if selvals:
             try:
@@ -324,10 +301,16 @@ if run_analysis:
             except Exception:
                 st.warning(f"Filter {s} could not be applied (type mismatch).")
 
+    # persist filtered df
+    st.session_state["filtered_df"] = df2.copy()
+    # clear cached RAG index so it rebuilds for new filter
+    for k in ["rag_passages", "rag_vect", "rag_mat", "_rag_source_sig"]:
+        st.session_state.pop(k, None)
+
     st.markdown(f'<div class="info-card"><strong>📋 Filtered Dataset</strong> • {len(df2)} rows</div>', unsafe_allow_html=True)
     st.dataframe(df2.head(8), use_container_width=True, height=200)
 
-    # Normalize churn
+    # normalize churn
     churn_key = None
     churn_rate = None
     if churn_col != "(none)":
@@ -342,19 +325,12 @@ if run_analysis:
     # numeric coercion
     total_customers = len(df2)
     avg_tenure = None
-    avg_tenure_fmt = "N/A"
     if tenure_col != "(none)":
         df2[tenure_col] = pd.to_numeric(df2[tenure_col], errors="coerce")
-        if df2[tenure_col].dropna().shape[0] > 0:
-            avg_tenure = df2[tenure_col].dropna().mean()
-            avg_tenure_fmt = f"{avg_tenure:.1f}"
+        avg_tenure = df2[tenure_col].dropna().mean() if df2[tenure_col].dropna().shape[0] > 0 else None
 
     if "MonthlyCharges" in df2.columns:
         df2["MonthlyCharges"] = pd.to_numeric(df2["MonthlyCharges"], errors="coerce")
-    avg_monthly_fmt = "N/A"
-    if "MonthlyCharges" in df2.columns and df2["MonthlyCharges"].dropna().shape[0] > 0:
-        avg_monthly = df2["MonthlyCharges"].mean()
-        avg_monthly_fmt = f"{avg_monthly:.2f}"
 
     # KPIs
     k1, k2, k3, k4 = st.columns(4)
@@ -367,8 +343,11 @@ if run_analysis:
         else:
             st.markdown(f'<div class="metric-card"><div class="metric-sub">🔴 Churn Rate</div><div class="metric-value">N/A</div></div>', unsafe_allow_html=True)
     with k3:
+        avg_tenure_fmt = "N/A" if avg_tenure is None or (isinstance(avg_tenure, float) and np.isnan(avg_tenure)) else f"{avg_tenure:.1f}"
         st.markdown(f'<div class="metric-card"><div class="metric-sub">📅 Avg Tenure</div><div class="metric-value">{avg_tenure_fmt}</div></div>', unsafe_allow_html=True)
     with k4:
+        avg_monthly = df2["MonthlyCharges"].mean() if "MonthlyCharges" in df2.columns and df2["MonthlyCharges"].dropna().shape[0] > 0 else None
+        avg_monthly_fmt = "N/A" if avg_monthly is None or (isinstance(avg_monthly, float) and np.isnan(avg_monthly)) else f"{avg_monthly:.2f}"
         st.markdown(f'<div class="metric-card"><div class="metric-sub">💳 Avg Monthly</div><div class="metric-value">{avg_monthly_fmt}</div></div>', unsafe_allow_html=True)
 
     st.markdown("---")
@@ -403,7 +382,6 @@ if run_analysis:
         if churn_key and "MonthlyCharges" in df2.columns:
             tmp = df2[["MonthlyCharges", churn_key]].dropna()
             if tmp.shape[0] > 0:
-                # map churn values to readable categories
                 tmp[churn_key] = tmp[churn_key].astype(int).map({0: "No", 1: "Yes"})
                 fig = px.box(tmp, x=churn_key, y="MonthlyCharges", points="all", color_discrete_sequence=PALETTE)
                 fig = dark_plotly_layout(fig, height=340)
@@ -478,7 +456,7 @@ if run_analysis:
 
     st.markdown("---")
 
-    # Payment method & internet service charts
+    # Payment method & internet service
     c1, c2 = st.columns(2)
     with c1:
         st.markdown('<div class="chart-card"><strong>💳 Churn by Payment Method</strong></div>', unsafe_allow_html=True)
@@ -560,66 +538,73 @@ if run_analysis:
     except Exception:
         pass
 
-    # ------------------ RAG UI (below dashboard) --------------------
-    st.markdown("---")
-    st.markdown('<div class="chart-card"><strong>🔎 RAG Q&A (ask about your uploaded dataset)</strong></div>', unsafe_allow_html=True)
+# ------------------ RAG UI (fast, safe, single block) --------------------
+st.markdown("---")
+st.markdown('<div class="chart-card"><strong>🔎 RAG Q&A (ask about your dataset)</strong></div>', unsafe_allow_html=True)
 
-    # Build corpus from df2 (cap to reasonable number)
-    max_corpus_rows = 5000
-    passages = build_corpus_from_df(df2, max_rows=max_corpus_rows)
-    vect, mat = build_tfidf_index(passages)
+# choose source df (prefer filtered in session_state)
+_df_for_rag = st.session_state.get("filtered_df", df)
 
-    user_question = st.text_input("Ask a question about the dataset (e.g., 'Which contract has highest churn?')", key="rag_question")
-    top_k = st.number_input("Top-K passages", min_value=1, max_value=10, value=3, key="rag_topk")
-    use_gemini = st.checkbox("Use Gemini (if configured in Streamlit secrets)", value=True, key="use_gemini")
+# create a small signature to know when to rebuild
+_source_sig = (tuple(_df_for_rag.columns), len(_df_for_rag))
 
-    # Debug / store index in session_state to avoid rebuild
-    if "rag_passages" not in st.session_state:
-        st.session_state["rag_passages"] = passages
-    if "rag_vect" not in st.session_state or "rag_mat" not in st.session_state:
+if st.session_state.get("_rag_source_sig") != _source_sig:
+    st.session_state["_rag_source_sig"] = _source_sig
+    st.session_state["rag_passages"] = build_corpus_from_df_sampled(_df_for_rag, max_rows=MAX_RAG_ROWS, max_chars=MAX_PASSAGE_CHARS)
+    st.session_state["rag_vect"], st.session_state["rag_mat"] = build_tfidf_index_safe(st.session_state.get("rag_passages", []), max_features=TFIDF_MAX_FEATURES)
+
+if "rag_passages" not in st.session_state:
+    st.session_state["rag_passages"] = []
+if "rag_vect" not in st.session_state:
+    st.session_state["rag_vect"] = None
+if "rag_mat" not in st.session_state:
+    st.session_state["rag_mat"] = None
+
+st.caption(f"Indexing: up to {MAX_RAG_ROWS} rows sampled • truncating long rows • TF-IDF max features: {TFIDF_MAX_FEATURES}")
+
+user_question = st.text_input("Ask a question about the dataset (e.g., 'Which contract has highest churn?')", key="rag_ui_question")
+top_k = st.number_input("Top-K passages", min_value=1, max_value=10, value=3, key="rag_ui_topk")
+gemini_checkbox = st.checkbox("Use Gemini (if configured in secrets) — WARNING: may block/wait", value=False, key="rag_ui_gemini")
+
+if st.button("Run RAG", key="run_rag_ui"):
+    if not user_question or not user_question.strip():
+        st.warning("Please enter a question.")
+    elif st.session_state["rag_vect"] is None or st.session_state["rag_mat"] is None or len(st.session_state["rag_passages"]) == 0:
+        st.error("Retriever not ready or no passages indexed. Try re-running analysis or reduce MAX_RAG_ROWS.")
+    else:
         try:
-            st.session_state["rag_vect"], st.session_state["rag_mat"] = build_tfidf_index(st.session_state["rag_passages"])
-        except Exception:
-            st.session_state["rag_vect"], st.session_state["rag_mat"] = None, None
-
-    if st.button("Run RAG", key="run_rag"):
-        if not user_question or not user_question.strip():
-            st.warning("Please enter a question.")
-        else:
-            if st.session_state.get("rag_vect") is None or st.session_state.get("rag_mat") is None:
-                st.error("Retriever not ready. The TF-IDF index couldn't be built.")
+            with st.spinner("Retrieving relevant passages..."):
+                retrieved = retrieve_top_k_from_index(user_question, st.session_state["rag_vect"], st.session_state["rag_mat"], st.session_state["rag_passages"], k=top_k)
+            if not retrieved:
+                st.info("No relevant passages found.")
             else:
-                try:
-                    with st.spinner("Retrieving top-k passages..."):
-                        retrieved = retrieve_top_k(user_question, st.session_state["rag_vect"], st.session_state["rag_mat"], st.session_state["rag_passages"], k=top_k)
-                    if not retrieved:
-                        st.info("No relevant passages found.")
-                    else:
-                        st.success(f"Retrieved {len(retrieved)} passages.")
-                        ctx_text = ""
-                        for score, passage, idx in retrieved:
-                            st.markdown(f"**score:** {score:.3f}")
-                            st.write(passage)
-                            ctx_text += passage + "\n\n"
+                st.success(f"Found {len(retrieved)} relevant passages.")
+                context_text = ""
+                for score, passage, idx in retrieved:
+                    st.markdown(f"**Score:** {score:.3f}")
+                    st.markdown(textwrap.fill(passage, width=140))
+                    st.markdown("---")
+                    context_text += passage + "\n\n"
 
+                gemini_answer = None
+                if gemini_checkbox:
+                    try:
+                        st.info("Calling Gemini (this may take several seconds)...")
+                        gemini_answer = call_gemini_generate(context_text, user_question)
+                    except Exception as e:
+                        st.error(f"Gemini call failed: {e}")
                         gemini_answer = None
-                        if use_gemini:
-                            st.info("Calling Gemini (this may take several seconds)...")
-                            gemini_answer = call_gemini_generate(ctx_text, user_question, timeout_sec=20)
 
-                        if gemini_answer:
-                            st.subheader("Answer (Gemini)")
-                            st.write(gemini_answer)
-                        else:
-                            st.subheader("Fallback extractive answer")
-                            summary = extractive_summary_from_passages([p for _, p, _ in retrieved], user_question, max_sentences=4)
-                            if summary:
-                                st.write(summary)
-                            else:
-                                st.info("No extractive sentences found.")
-                except Exception as err:
-                    st.error("RAG pipeline failed — see debug below.")
-                    st.exception(err)
-
-else:
-    st.info('👈 Configure columns + filters → Click **Run Analysis** 🚀')
+                if gemini_answer:
+                    st.subheader("Answer from Gemini")
+                    st.write(gemini_answer)
+                else:
+                    st.subheader("Extractive fallback answer")
+                    summary = extractive_summary_from_passages([p for _, p, _ in retrieved], user_question, max_sentences=4)
+                    if summary:
+                        st.write(summary)
+                    else:
+                        st.info("No extractive sentences found; see retrieved passages above.")
+        except Exception as err:
+            st.error("RAG pipeline failed — see details below.")
+            st.exception(err)
