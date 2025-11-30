@@ -269,7 +269,7 @@ def call_gemini_generate(context_text: str, user_question: str):
     if not ok:
         return None
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = f"""
 You are a customer churn analytics assistant.
 Use ONLY the context below — do NOT hallucinate. Answer concisely and reference context.
