@@ -1,5 +1,5 @@
 # app.py
-# Combined: PowerBI-style Dark Churn Dashboard + RAG Q&A with Gemini
+# Combined: PowerBI-style Dark Churn Dashboard + RAG Q&A with Gemini (optional)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -564,7 +564,7 @@ st.caption(f"Indexing: up to {MAX_RAG_ROWS} rows sampled • truncating long row
 
 user_question = st.text_input("Ask a question about the dataset (e.g., 'Which contract has highest churn?')", key="rag_ui_question")
 top_k = st.number_input("Top-K passages", min_value=1, max_value=10, value=3, key="rag_ui_topk")
-gemini_checkbox = st.checkbox("Use RAG", value=True, key="rag_ui_gemini")
+gemini_checkbox = st.checkbox("Use Gemini (if configured in secrets) — WARNING: may block/wait", value=False, key="rag_ui_gemini")
 
 if st.button("Run RAG", key="run_rag_ui"):
     if not user_question or not user_question.strip():
@@ -589,7 +589,7 @@ if st.button("Run RAG", key="run_rag_ui"):
                 gemini_answer = None
                 if gemini_checkbox:
                     try:
-                        st.info("Answer Fetched!!")
+                        st.info("Calling Gemini (this may take several seconds)...")
                         gemini_answer = call_gemini_generate(context_text, user_question)
                     except Exception as e:
                         st.error(f"Gemini call failed: {e}")
@@ -599,10 +599,10 @@ if st.button("Run RAG", key="run_rag_ui"):
                     st.subheader("Answer from Gemini")
                     st.write(gemini_answer)
                 else:
-                    st.subheader("Answer from Gemini")
+                    st.subheader("Extractive fallback answer")
                     summary = extractive_summary_from_passages([p for _, p, _ in retrieved], user_question, max_sentences=4)
                     if summary:
-                        st.write("Your Answer ->",summary)
+                        st.write(summary)
                     else:
                         st.info("No extractive sentences found; see retrieved passages above.")
         except Exception as err:
